@@ -3,6 +3,7 @@
 #include <linux/module.h>
 #include <linux/inet.h>
 #include <linux/slab.h>
+#include <linux/device.h>
 
 #include <rdma/ib_verbs.h>
 #include <rdma/rdma_cm.h>
@@ -11,11 +12,6 @@
 enum rdma_struct_flags_bit {
 	ADDR_RESOLVED = 0,
 	ROUTE_RESOLVED,
-};
-
-struct msg {
-	unsigned long key;
-	unsigned long data;
 };
 
 struct rdma_struct {
@@ -34,12 +30,12 @@ struct rdma_struct {
 #define BUF_SIZE	256		// 256 * 16 = 4096
 	struct ib_sge recv_sgl;
 	struct ib_recv_wr rq_wr;
-	struct msg *recv_buf;
+	char *recv_buf;
 	dma_addr_t recv_dma_addr;	// dma addr of recv_buf
 
 	struct ib_sge send_sgl;
 	struct ib_send_wr sq_wr;
-	struct msg *send_buf;
+	char *send_buf;
 	dma_addr_t send_dma_addr;	// dma addr of send_buf
 
 	struct ib_sge rdma_sgl;
@@ -90,12 +86,12 @@ static void init_requests(struct rdma_struct *rdma_d)
 
 static int prepare_buffer(struct rdma_struct *rdma_d)
 {
-	rdma_d->recv_buf = (struct msg *)__get_free_page(GFP_KERNEL | GFP_DMA);
+	rdma_d->recv_buf = (char *)__get_free_page(GFP_KERNEL | GFP_DMA);
 	if (IS_ERR(rdma_d->recv_buf)) {
 		printk(KERN_ERR "alloc recv_buf failed.\n");
 		return -ENOMEM;
 	}
-	rdma_d->send_buf = (struct msg *)__get_free_page(GFP_KERNEL | GFP_DMA);
+	rdma_d->send_buf = (char *)__get_free_page(GFP_KERNEL | GFP_DMA);
 	if (IS_ERR(rdma_d->send_buf)) {
 		printk(KERN_ERR "alloc send_buf failed.\n");
 		goto free_recv_buf;
@@ -148,13 +144,67 @@ static void destroy_buffer(struct rdma_struct *rdma_d)
 
 static void rdma_cq_event_handler(struct ib_cq *cq, void *ctx)
 {
-	int ret;
-	struct ib_wc wc;
-	struct rdma_struct *rdma_d = ctx;
+	printk(KERN_ERR "111\n");
 
-	while ((ret = ib_poll_cq(rdma_d->cq, 1, &wc)) == 1) {
+/*	while ((ret = ib_poll_cq(rdma_d->cq, 1, &wc)) == 1) {
 		printk("opcode=0x%x, state=%d.\n", wc.opcode, wc.status);
 	}
+	*/
+}
+
+static int send_mr(struct rdma_struct *rdma_d)
+{
+	const struct ib_send_wr *bad_wr;
+	int ret = 0;
+	u8 key = 0;
+	struct scatterlist sg = {0};
+
+	ib_update_fast_reg_key(rdma_d->mr, ++key);
+	rdma_d->reg_mr_wr.key = rdma_d->mr->rkey;
+	rdma_d->reg_mr_wr.access = IB_ACCESS_REMOTE_READ | IB_ACCESS_LOCAL_WRITE;
+//	sg_dma_address(&sg) = rdma_d->send_buf;
+	sg_dma_address(&sg) = rdma_d->send_dma_addr;
+	sg_dma_len(&sg) = PAGE_SIZE;
+
+	ret = ib_map_mr_sg(rdma_d->mr, &sg, 1, NULL, PAGE_SIZE);
+	if (ret < 0 || ret > PAGE_SIZE) {
+		printk(KERN_ERR "map_mr_sg failed\n");
+		return -1;
+	}
+
+	ret = ib_post_send(rdma_d->cm_id->qp, &rdma_d->reg_mr_wr.wr, &bad_wr);
+	if (ret) {
+		printk(KERN_ERR "post reg_mr_wr failed\n");
+		return -2;
+	}
+
+	return 0;
+}
+
+static int send_data(struct rdma_struct *rdma_d)
+{
+	const struct ib_send_wr *bad_wr;
+	int ret;
+	struct ib_wc wc = {0};
+
+	ret = send_mr(rdma_d);
+
+	memcpy(rdma_d->send_buf, "abccba", 7);
+	ret = ib_post_send(rdma_d->cm_id->qp, &rdma_d->sq_wr, &bad_wr);
+	if (ret) {
+		printk(KERN_ERR "post sq_wr failed\n");
+		return -2;
+	}
+
+	while ((ret = ib_poll_cq(rdma_d->cq, 1, &wc)) == 0);
+
+	if (ret < 0) {
+		printk(KERN_ERR "poll cq failed\n");
+		return -3;
+	}
+	printk("opcode=0x%x, state=%d.\n", wc.opcode, wc.status);
+
+	return 0;
 }
 
 static int rdma_cm_handler(struct rdma_cm_id *cm_id, struct rdma_cm_event *event)
@@ -184,6 +234,13 @@ static int rdma_cm_handler(struct rdma_cm_id *cm_id, struct rdma_cm_event *event
 			break;
 		case RDMA_CM_EVENT_ESTABLISHED:
 			printk(KERN_ERR "event is ESTABLISHED.\n");
+			printk(KERN_ERR "start send data.\n");
+			err = send_data(rdma_d);
+			if (err) {
+				printk(KERN_ERR "send data failed.\n");
+			} else {
+				printk(KERN_ERR "send data done.\n");
+			}
 			break;
 		case RDMA_CM_EVENT_DISCONNECTED:
 			printk(KERN_ERR "event is DISCONNECTED.\n");
@@ -285,6 +342,7 @@ static struct ib_cq *do_alloc_cq(struct rdma_cm_id *cm_id)
 	cq_attr.comp_vector = 0;
 	return ib_create_cq(cm_id->device, rdma_cq_event_handler, NULL, cm_id, &cq_attr);
 //	return ib_req_notify_cq(rdma_d->cq, IB_CQ_NEXT_COMP);
+//	return ib_alloc_cq(cm_id->device, cm_id, 128 * 2, 0, IB_POLL_WORKQUEUE)
 }
 
 static int __init rdma_init(void)
