@@ -8,17 +8,14 @@
 #include <rdma/rdma_cm.h>
 #include <rdma/rw.h>
 
-
-
-struct rdma_info {
-	u64 buf;
-	u32 key;
-	u32 size;
-};
-
 enum rdma_struct_flags_bit {
 	ADDR_RESOLVED = 0,
 	ROUTE_RESOLVED,
+};
+
+struct msg {
+	unsigned long key;
+	unsigned long data;
 };
 
 struct rdma_struct {
@@ -30,13 +27,27 @@ struct rdma_struct {
 	struct rdma_cm_event *event;
 	struct rdma_listener *listener;
 
-	struct ib_cq *cq;
 	struct ib_pd *pd;
-	struct ib_qp *qp;
+	struct ib_cq *cq;
+	struct ib_mr *mr;
 
-	struct rdma_info recv_buf;
+#define BUF_SIZE	256		// 256 * 16 = 4096
+	struct ib_sge recv_sgl;
+	struct ib_recv_wr rq_wr;
+	struct msg *recv_buf;
+	dma_addr_t recv_dma_addr;	// dma addr of recv_buf
 
-	struct ib_mr *reg_mr;
+	struct ib_sge send_sgl;
+	struct ib_send_wr sq_wr;
+	struct msg *send_buf;
+	dma_addr_t send_dma_addr;	// dma addr of send_buf
+
+	struct ib_sge rdma_sgl;
+	struct ib_rdma_wr rdma_sq_wr;
+	char *rdma_buf;
+	dma_addr_t rdma_dma_addr;	// dma addr of rdma_buf
+
+	struct ib_reg_wr reg_mr_wr;
 
 	wait_queue_head_t wait;
 };
@@ -45,6 +56,95 @@ struct rdma_struct rdma_d;
 
 static int do_alloc_qp(struct rdma_cm_id *cm_id, struct ib_pd *pd, struct ib_cq *cq);
 static struct ib_cq *do_alloc_cq(struct rdma_cm_id *cm_id);
+
+static void init_requests(struct rdma_struct *rdma_d)
+{
+	// recv request
+	rdma_d->recv_sgl.addr = rdma_d->recv_dma_addr;
+	rdma_d->recv_sgl.length = PAGE_SIZE;
+	rdma_d->recv_sgl.lkey = rdma_d->pd->local_dma_lkey;
+
+	rdma_d->rq_wr.sg_list = &rdma_d->recv_sgl;
+	rdma_d->rq_wr.num_sge = 1;
+
+	// send request
+	rdma_d->send_sgl.addr = rdma_d->send_dma_addr;
+	rdma_d->send_sgl.length = PAGE_SIZE;
+	rdma_d->send_sgl.lkey = rdma_d->pd->local_dma_lkey;
+
+	rdma_d->sq_wr.opcode = IB_WR_SEND;
+	rdma_d->sq_wr.send_flags = IB_SEND_SIGNALED;
+	rdma_d->sq_wr.sg_list = &rdma_d->send_sgl;
+	rdma_d->sq_wr.num_sge = 1;
+
+	// rdma request
+	rdma_d->rdma_sgl.addr = rdma_d->rdma_dma_addr;
+	rdma_d->rdma_sq_wr.wr.send_flags = IB_SEND_SIGNALED;
+	rdma_d->rdma_sq_wr.wr.sg_list = &rdma_d->rdma_sgl;
+	rdma_d->rdma_sq_wr.wr.num_sge = 1;
+
+	// reg mr request
+	rdma_d->reg_mr_wr.wr.opcode = IB_WR_REG_MR;
+	rdma_d->reg_mr_wr.mr = rdma_d->mr;
+}
+
+static int prepare_buffer(struct rdma_struct *rdma_d)
+{
+	rdma_d->recv_buf = (struct msg *)__get_free_page(GFP_KERNEL | GFP_DMA);
+	if (IS_ERR(rdma_d->recv_buf)) {
+		printk(KERN_ERR "alloc recv_buf failed.\n");
+		return -ENOMEM;
+	}
+	rdma_d->send_buf = (struct msg *)__get_free_page(GFP_KERNEL | GFP_DMA);
+	if (IS_ERR(rdma_d->send_buf)) {
+		printk(KERN_ERR "alloc send_buf failed.\n");
+		goto free_recv_buf;
+	}
+	rdma_d->recv_dma_addr = ib_dma_map_single(rdma_d->pd->device, rdma_d->recv_buf, PAGE_SIZE, DMA_BIDIRECTIONAL);
+	rdma_d->send_dma_addr = ib_dma_map_single(rdma_d->pd->device, rdma_d->send_buf, PAGE_SIZE, DMA_BIDIRECTIONAL);
+	rdma_d->rdma_buf = ib_dma_alloc_coherent(rdma_d->pd->device, PAGE_SIZE, &rdma_d->rdma_dma_addr, GFP_KERNEL);
+	if (!rdma_d->rdma_buf || !rdma_d->send_dma_addr || !rdma_d->recv_dma_addr) {
+		printk(KERN_ERR "map dma addr failed\n");
+		goto free_dma_addr;
+	}
+
+	rdma_d->mr = ib_alloc_mr(rdma_d->pd, IB_MR_TYPE_MEM_REG, PAGE_SIZE);
+	if (IS_ERR(rdma_d->mr)) {
+		printk(KERN_ERR "alloc mr failed.\n");
+		goto free_dma_addr;
+	}
+
+	init_requests(rdma_d);
+
+	return 0;
+free_dma_addr:
+	if (rdma_d->recv_dma_addr)
+		ib_dma_unmap_single(rdma_d->pd->device, (unsigned long)rdma_d->recv_buf, PAGE_SIZE, DMA_BIDIRECTIONAL);
+	if (rdma_d->send_dma_addr)
+		ib_dma_unmap_single(rdma_d->pd->device, (unsigned long)rdma_d->send_buf, PAGE_SIZE, DMA_BIDIRECTIONAL);
+	if (rdma_d->rdma_buf)
+		ib_dma_free_coherent(rdma_d->pd->device, PAGE_SIZE, rdma_d->rdma_buf, rdma_d->rdma_dma_addr);
+	free_page((unsigned long)rdma_d->send_buf);
+free_recv_buf:
+	free_page((unsigned long)rdma_d->recv_buf);
+	return -ENOMEM;
+}
+
+static void destroy_buffer(struct rdma_struct *rdma_d)
+{
+	if (rdma_d->mr)
+		ib_dereg_mr(rdma_d->mr);
+	if (rdma_d->recv_dma_addr)
+		ib_dma_unmap_single(rdma_d->pd->device, (unsigned long)rdma_d->recv_buf, PAGE_SIZE, DMA_BIDIRECTIONAL);
+	if (rdma_d->send_dma_addr)
+		ib_dma_unmap_single(rdma_d->pd->device, (unsigned long)rdma_d->send_buf, PAGE_SIZE, DMA_BIDIRECTIONAL);
+	if (rdma_d->rdma_buf)
+		ib_dma_free_coherent(rdma_d->pd->device, PAGE_SIZE, rdma_d->rdma_buf, rdma_d->rdma_dma_addr);
+	if (rdma_d->send_buf)
+		free_page((unsigned long)rdma_d->send_buf);
+	if (rdma_d->recv_buf)
+		free_page((unsigned long)rdma_d->recv_buf);
+}
 
 static void rdma_cq_event_handler(struct ib_cq *cq, void *ctx)
 {
@@ -122,12 +222,16 @@ static int rdma_cm_handler(struct rdma_cm_id *cm_id, struct rdma_cm_event *event
 				ib_dealloc_pd(pd);
 				break;
 			}
+
+			rdma_d->pd = pd;
+			rdma_d->cq = cq;
+			prepare_buffer(rdma_d);
 			conn_param.responder_resources = 1;
 			conn_param.initiator_depth = 1;
 			conn_param.retry_count = 10;
 			printk(KERN_ERR "do connect.\n");
-//			ret = rdma_connect(rdma_d.cm_id, &conn_param);
-			err = rdma_connect(cm_id, &conn_param);
+			err = rdma_connect(rdma_d->cm_id, &conn_param);
+//			err = rdma_connect(cm_id, &conn_param);
 			if (err < 0) {
 				printk(KERN_ERR "connect failed.\n");
 			}
@@ -212,9 +316,11 @@ static int __init rdma_init(void)
 	return 0;
 
 destroy_cm_id:
-	if (rdma_d.qp && !IS_ERR(rdma_d.qp)) {
-		ib_destroy_qp(rdma_d.qp);
-		rdma_d.qp = NULL;
+	if (rdma_d.cm_id) {
+		if (rdma_d.cm_id->qp && !IS_ERR(rdma_d.cm_id->qp))
+			ib_destroy_qp(rdma_d.cm_id->qp);
+		rdma_destroy_id(rdma_d.cm_id);
+		rdma_d.cm_id = NULL;
 	}
 	if (rdma_d.cq && !IS_ERR(rdma_d.cq)) {
 		ib_destroy_cq(rdma_d.cq);
@@ -224,25 +330,21 @@ destroy_cm_id:
 		ib_dealloc_pd(rdma_d.pd);
 		rdma_d.pd = NULL;
 	}
-	if (rdma_d.cm_id) {
-		rdma_destroy_id(rdma_d.cm_id);
-		rdma_d.cm_id = NULL;
-	}
 	return ret;
 }
 
 static void __exit rdma_exit(void) {
-	if (rdma_d.qp && !IS_ERR(rdma_d.qp)) {
-		ib_destroy_qp(rdma_d.qp);
+	if (rdma_d.cm_id) {
+		if (rdma_d.cm_id->qp && !IS_ERR(rdma_d.cm_id->qp))
+			ib_destroy_qp(rdma_d.cm_id->qp);
+		rdma_destroy_id(rdma_d.cm_id);
 	}
+	destroy_buffer(&rdma_d);
 	if (rdma_d.cq && !IS_ERR(rdma_d.cq)) {
 		ib_destroy_cq(rdma_d.cq);
 	}
 	if (rdma_d.pd && !IS_ERR(rdma_d.pd)) {
 		ib_dealloc_pd(rdma_d.pd);
-	}
-	if (rdma_d.cm_id) {
-		rdma_destroy_id(rdma_d.cm_id);
 	}
 }
 
