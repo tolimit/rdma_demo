@@ -16,11 +16,6 @@ enum rdma_struct_flags_bit {
 	ROUTE_RESOLVED,
 };
 
-struct msg {
-	unsigned long key;
-	unsigned long data;
-};
-
 struct rdma_connection {
 	unsigned long state;
 	struct rdma_cm_id *cm_id;
@@ -32,12 +27,12 @@ struct rdma_connection {
 #define BUF_SIZE	256		// 256 * 16 = 4096
 	struct ib_sge recv_sgl;
 	struct ib_recv_wr rq_wr;
-	struct msg *recv_buf;
+	char *recv_buf;
 	dma_addr_t recv_dma_addr;	// dma addr of recv_buf
 
 	struct ib_sge send_sgl;
 	struct ib_send_wr sq_wr;
-	struct msg *send_buf;
+	char *send_buf;
 	dma_addr_t send_dma_addr;	// dma addr of send_buf
 
 	struct ib_sge rdma_sgl;
@@ -105,12 +100,12 @@ static void init_requests(struct rdma_connection *rdma_c)
 
 static int prepare_buffer(struct rdma_connection *rdma_c)
 {
-	rdma_c->recv_buf = (struct msg *)__get_free_page(GFP_KERNEL | GFP_DMA);
+	rdma_c->recv_buf = (char *)__get_free_page(GFP_KERNEL | GFP_DMA);
 	if (IS_ERR(rdma_c->recv_buf)) {
 		printk(KERN_ERR "alloc recv_buf failed.\n");
 		return -ENOMEM;
 	}
-	rdma_c->send_buf = (struct msg *)__get_free_page(GFP_KERNEL | GFP_DMA);
+	rdma_c->send_buf = (char *)__get_free_page(GFP_KERNEL | GFP_DMA);
 	if (IS_ERR(rdma_c->send_buf)) {
 		printk(KERN_ERR "alloc send_buf failed.\n");
 		goto free_recv_buf;
@@ -147,7 +142,6 @@ free_recv_buf:
 
 static int add_to_connection_list(struct rdma_cm_id *cm_id, struct ib_pd *pd, struct ib_cq *cq)
 {
-	struct rdma_struct *rdma_d = cm_id->context;
 	struct rdma_connection *_new = kzalloc(sizeof(struct rdma_connection), GFP_KERNEL);
 	if (_new == NULL)
 		return -ENOMEM;
@@ -155,15 +149,16 @@ static int add_to_connection_list(struct rdma_cm_id *cm_id, struct ib_pd *pd, st
 	_new->cm_id = cm_id;
 	_new->pd = pd;
 	_new->cq = cq;
+	cm_id->context = _new;
 	INIT_LIST_HEAD(&_new->list);
 	if (prepare_buffer(_new)) {
 		kfree(_new);
 		return -ENOMEM;
 	}
 	printk(KERN_ERR "new connection 0x%p\n", _new);
-	mutex_lock(&rdma_d->connection_lock);
-	list_add_tail(&rdma_d->connection_list, &_new->list);
-	mutex_unlock(&rdma_d->connection_lock);
+	mutex_lock(&rdma_d.connection_lock);
+	list_add_tail(&rdma_d.connection_list, &_new->list);
+	mutex_unlock(&rdma_d.connection_lock);
 
 	return 0;
 }
@@ -172,9 +167,10 @@ static int do_accept(struct rdma_cm_id *cm_id, struct rdma_cm_event *event)
 {
 	struct rdma_conn_param conn_param;
 	int err = 0;
-//	struct rdma_struct *rdma_d = cm_id->context;
 	struct ib_pd *pd = NULL;
 	struct ib_cq *cq = NULL;
+	struct rdma_connection *rdma_c = NULL;
+	const struct ib_recv_wr *bad_wr;
 
 	// alloc pd
 	if (cm_id->device == NULL) {
@@ -195,6 +191,7 @@ static int do_accept(struct rdma_cm_id *cm_id, struct rdma_cm_event *event)
 		err = PTR_ERR(cq);
 		goto failed;
 	}
+//	ib_req_notify_cq(cq, IB_CQ_NEXT_COMP);
 	printk(KERN_ERR "alloc cq\n");
 	// create qp
 	err = do_alloc_qp(cm_id, pd, cq);
@@ -210,6 +207,12 @@ static int do_accept(struct rdma_cm_id *cm_id, struct rdma_cm_event *event)
 	if ((err = add_to_connection_list(cm_id, pd, cq)))
 		goto failed;
 
+	rdma_c = cm_id->context;
+	err = ib_post_recv(cm_id->qp, &rdma_c->rq_wr, &bad_wr);
+	if (err) {
+		printk(KERN_ERR "post recv failed.\n");
+		goto out;
+	}
 	err = rdma_accept(cm_id, &conn_param);
 	if (err) {
 		printk(KERN_ERR "accept failed, error=%d.\n", err);
@@ -237,11 +240,20 @@ static void rdma_cq_event_handler(struct ib_cq *cq, void *ctx)
 {
 	int ret;
 	struct ib_wc wc;
-//	struct rdma_cm_id *cm_id = ctx;
+	struct rdma_cm_id *cm_id = cq->cq_context;
+	struct rdma_connection *rdma_c =cm_id->context;
+	const struct ib_recv_wr *bad_wr;
 
-	while ((ret = ib_poll_cq(cq, 1, &wc)) == 1) {
-		printk("opcode=0x%x, state=%d.\n", wc.opcode, wc.status);
+	printk(KERN_ERR "enter cq_event_handler.\n");
+	if ((ret = ib_poll_cq(cq, 1, &wc)) == 1) {
+		printk(KERN_ERR "opcode=0x%x, state=%d.\n", wc.opcode, wc.status);
+		printk(KERN_ERR "recv_buf[0]=%c.\n", rdma_c->recv_buf[0]);
+		printk(KERN_ERR "rdma_buf[0]=%c.\n", rdma_c->rdma_buf[0]);
+		if (ib_post_recv(cm_id->qp, &rdma_c->rq_wr, &bad_wr))
+			printk("1 post_recv failed.\n");
 	}
+//	ib_req_notify_cq(cq, IB_CQ_NEXT_COMP);
+	printk(KERN_ERR "exit cq_event_handler.\n");
 }
 
 static void destroy_buffer(struct rdma_connection *rdma_c)
