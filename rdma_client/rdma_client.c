@@ -15,7 +15,7 @@ enum rdma_struct_flags_bit {
 };
 
 struct rkey_msg {
-	u32 remote_key;
+	u64 remote_key;
 	u64 remote_addr;
 };
 
@@ -52,10 +52,11 @@ struct rdma_struct {
 
 	struct ib_reg_wr reg_mr_wr;
 
-	u8 remote_key;
+	u64 remote_key;
 	u64 remote_addr;
 
 	wait_queue_head_t wait;
+	struct work_struct send_data_work;
 };
 
 struct rdma_struct rdma_d;
@@ -158,7 +159,8 @@ static int send_mr(struct rdma_struct *rdma_d)
 	int ret = 0;
 	u8 key = 0;
 	struct scatterlist sg = {0};
-
+	
+	printk(KERN_ERR "%s()\n", __func__);
 	ib_update_fast_reg_key(rdma_d->mr, ++key);
 	rdma_d->reg_mr_wr.key = rdma_d->mr->rkey;
 	rdma_d->reg_mr_wr.access = IB_ACCESS_REMOTE_READ | IB_ACCESS_LOCAL_WRITE;
@@ -188,6 +190,7 @@ static int send_data(struct rdma_struct *rdma_d)
 	const struct ib_send_wr *bad_wr;
 	int ret;
 
+	printk(KERN_ERR "%s()\n", __func__);
 	memcpy(rdma_d->send_buf, "abccba", 7);
 	ret = ib_post_send(rdma_d->cm_id->qp, &rdma_d->sq_wr, &bad_wr);
 	if (ret) {
@@ -199,21 +202,30 @@ static int send_data(struct rdma_struct *rdma_d)
 	return 0;
 }
 
+static void send_data_fn(struct work_struct *work)
+{
+	struct rdma_struct *rdma_d = container_of(work, struct rdma_struct, send_data_work);
+
+	send_data(rdma_d);
+}
+
 static int send_rdma_addr(struct rdma_struct *rdma_d)
 {
 	const struct ib_send_wr *bad_wr;
 	int ret;
 	struct rkey_msg *msg;
 
+	printk(KERN_ERR "%s()\n", __func__);
 	msg = (struct rkey_msg *)rdma_d->send_buf;
-	msg->remote_key = rdma_d->mr->rkey;
-	msg->remote_addr = (unsigned long)rdma_d->recv_buf;
+	msg->remote_key = be64_to_cpu(rdma_d->mr->rkey);
+	msg->remote_addr = be64_to_cpu((unsigned long)rdma_d->recv_buf);
 	ret = ib_post_send(rdma_d->cm_id->qp, &rdma_d->sq_wr, &bad_wr);
 	if (ret) {
 		printk(KERN_ERR "post sq_wr failed\n");
 		return -2;
 	}
 
+	printk(KERN_ERR "%s(): rkey=%d, raddr=0x%lx", __func__, rdma_d->mr->rkey, (unsigned long)rdma_d->recv_buf);
 	ib_req_notify_cq(rdma_d->cq, IB_CQ_NEXT_COMP);
 	return 0;
 }
@@ -270,8 +282,9 @@ static void rdma_cq_event_handler(struct ib_cq *cq, void *ctx)
 					msg = (struct rkey_msg *)rdma_d->recv_buf;
 					rdma_d->remote_key = cpu_to_be64(msg->remote_key);
 					rdma_d->remote_addr = cpu_to_be64(msg->remote_addr);
-					send_data(rdma_d);
-					printk(KERN_ERR "recv mr finished, rkey=%d, addr=0x%llx.\n", rdma_d->remote_key, rdma_d->remote_addr);
+					printk(KERN_ERR "recv mr finished, rkey=%lld, addr=0x%llx.\n", rdma_d->remote_key, rdma_d->remote_addr);
+					INIT_WORK(&rdma_d->send_data_work, send_data_fn);
+					schedule_work(&rdma_d->send_data_work);
 				} else
 					printk(KERN_ERR "recv data finished.\n");
 				break;
