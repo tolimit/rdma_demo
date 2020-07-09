@@ -14,10 +14,18 @@
 enum rdma_struct_flags_bit {
 	ADDR_RESOLVED = 0,
 	ROUTE_RESOLVED,
+	REMOVING = 24,
+};
+
+struct rkey_msg {
+	u32 remote_key;
+	u64 remote_addr;
 };
 
 struct rdma_connection {
 	unsigned long state;
+	int send_mr_finished;
+	int recv_mr_finished;
 	struct rdma_cm_id *cm_id;
 
 	struct ib_pd *pd;
@@ -41,6 +49,8 @@ struct rdma_connection {
 	dma_addr_t rdma_dma_addr;	// dma addr of rdma_buf
 
 	struct ib_reg_wr reg_mr_wr;
+	u32 remote_key;
+	u64 remote_addr;
 
 	struct list_head list;
 	struct work_struct disconnect_work;
@@ -191,7 +201,6 @@ static int do_accept(struct rdma_cm_id *cm_id, struct rdma_cm_event *event)
 		err = PTR_ERR(cq);
 		goto failed;
 	}
-//	ib_req_notify_cq(cq, IB_CQ_NEXT_COMP);
 	printk(KERN_ERR "alloc cq\n");
 	// create qp
 	err = do_alloc_qp(cm_id, pd, cq);
@@ -213,6 +222,7 @@ static int do_accept(struct rdma_cm_id *cm_id, struct rdma_cm_event *event)
 		printk(KERN_ERR "post recv failed.\n");
 		goto out;
 	}
+	ib_req_notify_cq(cq, IB_CQ_NEXT_COMP);
 	err = rdma_accept(cm_id, &conn_param);
 	if (err) {
 		printk(KERN_ERR "accept failed, error=%d.\n", err);
@@ -234,26 +244,6 @@ failed:
 	
 out:
 	return err;
-}
-
-static void rdma_cq_event_handler(struct ib_cq *cq, void *ctx)
-{
-	int ret;
-	struct ib_wc wc;
-	struct rdma_cm_id *cm_id = cq->cq_context;
-	struct rdma_connection *rdma_c =cm_id->context;
-	const struct ib_recv_wr *bad_wr;
-
-	printk(KERN_ERR "enter cq_event_handler.\n");
-	if ((ret = ib_poll_cq(cq, 1, &wc)) == 1) {
-		printk(KERN_ERR "opcode=0x%x, state=%d.\n", wc.opcode, wc.status);
-		printk(KERN_ERR "recv_buf[0]=%c.\n", rdma_c->recv_buf[0]);
-		printk(KERN_ERR "rdma_buf[0]=%c.\n", rdma_c->rdma_buf[0]);
-		if (ib_post_recv(cm_id->qp, &rdma_c->rq_wr, &bad_wr))
-			printk("1 post_recv failed.\n");
-	}
-//	ib_req_notify_cq(cq, IB_CQ_NEXT_COMP);
-	printk(KERN_ERR "exit cq_event_handler.\n");
 }
 
 static void destroy_buffer(struct rdma_connection *rdma_c)
@@ -293,6 +283,120 @@ static void do_disconnect(struct work_struct *work)
 	mutex_unlock(&rdma_d.connection_lock);
 }
 
+static int send_mr(struct rdma_connection *rdma_c)
+{
+	const struct ib_send_wr *bad_wr;
+	struct rkey_msg *msg;
+	int ret = 0;
+	u8 key = 0;
+	struct scatterlist sg = {0};
+
+	ib_update_fast_reg_key(rdma_c->mr, ++key);
+	rdma_c->reg_mr_wr.key = rdma_c->mr->rkey;
+	rdma_c->reg_mr_wr.access = IB_ACCESS_REMOTE_WRITE | IB_ACCESS_LOCAL_WRITE;
+	sg_dma_address(&sg) = rdma_c->send_buf;
+//	sg_dma_address(&sg) = rdma_c->send_dma_addr;
+	sg_dma_len(&sg) = PAGE_SIZE;
+
+	ret = ib_map_mr_sg(rdma_c->mr, &sg, 1, NULL, PAGE_SIZE);
+	if (ret < 0 || ret > PAGE_SIZE) {
+		printk(KERN_ERR "map_mr_sg failed\n");
+		return -1;
+	}
+
+	ret = ib_post_send(rdma_c->cm_id->qp, &rdma_c->reg_mr_wr.wr, &bad_wr);
+	if (ret) {
+		printk(KERN_ERR "post reg_mr_wr failed\n");
+		return -2;
+	}
+	ib_req_notify_cq(rdma_c->cq, IB_CQ_NEXT_COMP);
+
+	msg = (struct rkey_msg *)rdma_c->send_buf;
+	msg->remote_key = be32_to_cpu(rdma_c->mr->rkey);
+	msg->remote_addr = be64_to_cpu(rdma_c->recv_buf); 
+
+	ret = ib_post_send(rdma_c->cm_id->qp, &rdma_c->sq_wr, &bad_wr);
+	if (ret) {
+		printk(KERN_ERR "post wq_wr failed\n");
+		return -4;
+	}
+
+	ib_req_notify_cq(rdma_c->cq, IB_CQ_NEXT_COMP);
+	return 0;
+}
+
+static int recv_data(struct rdma_connection *rdma_c)
+{
+	int ret;
+	const struct ib_recv_wr *bad_wr;
+	struct rdma_cm_id *cm_id = rdma_c->cm_id;
+
+	ret = ib_post_recv(cm_id->qp, &rdma_c->rq_wr, &bad_wr);
+	if (ret) {
+		printk(KERN_ERR "post recv after sending mr failed.\n");
+		return -1;
+	}
+
+	ib_req_notify_cq(rdma_c->cq, IB_CQ_NEXT_COMP);
+	return 0;
+}
+
+static void rdma_cq_event_handler(struct ib_cq *cq, void *ctx)
+{
+	int ret;
+	struct ib_wc wc;
+	struct rdma_cm_id *cm_id = cq->cq_context;
+	struct rdma_connection *rdma_c =cm_id->context;
+	struct rkey_msg *msg;
+
+	printk(KERN_ERR "enter cq_event_handler.\n");
+//	if (test_bit(REMOVING, &rdma_c->state))
+//		goto out;
+	while ((ret = ib_poll_cq(cq, 1, &wc)) == 1) {
+		printk(KERN_ERR "opcode=0x%x, state=%d.\n", wc.opcode, wc.status);
+		if (test_bit(REMOVING, &rdma_c->state))
+			break;
+
+		switch (wc.opcode) {
+			case IB_WC_SEND:
+				if (rdma_c->send_mr_finished == 0) {
+					printk(KERN_ERR "send mr finished.\n");
+					rdma_c->send_mr_finished = 1;
+					msg = (struct rkey_msg *)rdma_c->recv_buf;
+					rdma_c->remote_key = cpu_to_be64(msg->remote_key);
+					rdma_c->remote_addr = cpu_to_be64(msg->remote_addr);
+
+					printk("remote key=%d, remote addr=0x%llx", rdma_c->remote_key, rdma_c->remote_addr);
+					recv_data(rdma_c);
+				} else {
+					printk(KERN_ERR "send data finished.\n");
+				}
+				break;
+			case IB_WC_RDMA_WRITE:
+				break;
+			case IB_WC_RDMA_READ:
+				break;
+			case IB_WC_REG_MR:
+				break;
+			case IB_WC_RECV:
+				if (rdma_c->recv_mr_finished == 0) {
+					rdma_c->recv_mr_finished = 1;
+					send_mr(rdma_c);
+					printk(KERN_ERR "recv mr finished.\n");
+				} else {
+					printk(KERN_ERR "recv data finished.\n");
+					printk(KERN_ERR "recv_buf[0]=%c, recv_buf[1]=%c.\n", rdma_c->recv_buf[0], rdma_c->recv_buf[1]);
+				}
+				break;
+			default:
+				printk(KERN_ERR "unknow opcode=0x%x.\n", wc.opcode);
+				break;
+		}
+	}
+out:
+	printk(KERN_ERR "exit cq_event_handler.\n");
+}
+
 static int rdma_cm_handler(struct rdma_cm_id *cm_id, struct rdma_cm_event *event) {
 	int err = 0;
 	struct rdma_connection *pos, *next;
@@ -301,6 +405,10 @@ static int rdma_cm_handler(struct rdma_cm_id *cm_id, struct rdma_cm_event *event
 		case RDMA_CM_EVENT_CONNECT_REQUEST:
 			printk(KERN_ERR "event is connect_request.\n");
 			err = do_accept(cm_id, event);
+			if (err) {
+				printk(KERN_ERR "accept failed.\n");
+				break;
+			}
 			break;
 		case RDMA_CM_EVENT_ESTABLISHED:
 			printk(KERN_ERR "event is ESTABLISHED.\n");
@@ -424,6 +532,7 @@ static void __exit rdma_exit(void)
 		ib_dealloc_pd(pos->pd);
 		kfree(pos);
 */
+		set_bit(REMOVING, &pos->state);
 		INIT_WORK(&pos->disconnect_work, do_disconnect);
 		schedule_work(&pos->disconnect_work);
 	}
