@@ -469,8 +469,16 @@ static void rdma_recv_mr_done(struct ib_cq *cq, struct ib_wc *wc)
 			send_rdma_addr(rdma_c);
 			printk(KERN_ERR "recv mr finished, rkey=%lld, raddr=0x%llx.\n", rdma_c->remote_key, rdma_c->remote_addr);
 		} else {
-			printk(KERN_ERR "111 recv data finished.\n");
+			printk(KERN_ERR "recv_mr() recv data finished.\n");
 		}
+	}
+}
+
+
+static void rdma_rdma_send_done(struct ib_cq *cq, struct ib_wc *wc)
+{
+	if (likely(wc->status == IB_WC_SUCCESS)) {
+		printk(KERN_ERR "rdma send done\n");
 	}
 }
 
@@ -486,13 +494,6 @@ static void rdma_send_done(struct ib_cq *cq, struct ib_wc *wc)
 		} else {
 			printk(KERN_ERR "send data finished.\n");
 		}
-	}
-}
-
-static void rdma_rdma_send_done(struct ib_cq *cq, struct ib_wc *wc)
-{
-	if (likely(wc->status == IB_WC_SUCCESS)) {
-		printk(KERN_ERR "rdma send done\n");
 	}
 }
 
@@ -564,16 +565,10 @@ static int rdma_cm_handler(struct rdma_cm_id *cm_id, struct rdma_cm_event *event
 			printk(KERN_ERR "event is ESTABLISHED.\n");
 			rdma_c = cm_id->context;
 			rdma_cc = rdma_c;
-			printk(KERN_ERR "debugfs_dir=0x%p, send_file=0x%p.\n", rdma_c->debugfs_dir, rdma_c->send_file);
-//			if (rdma_c->debugfs_dir == NULL) {
-				rdma_c->debugfs_dir = debugfs_create_dir("connection", debugfs_root);
-				printk(KERN_ERR "create connection path.\n");
-//			}
-			printk(KERN_ERR "debugfs_dir=0x%p, send_file=0x%p.\n", rdma_c->debugfs_dir, rdma_c->send_file);
-//			if (rdma_c->debugfs_dir && (rdma_c->send_file == NULL)) {
-				rdma_c->send_file = debugfs_create_file("send", 0600, rdma_c->debugfs_dir, rdma_c->send_buf, &send_file_fops);
-				printk(KERN_ERR "create send file.\n");
-//			}
+			rdma_c->debugfs_dir = debugfs_create_dir("connection", debugfs_root);
+			printk(KERN_ERR "create connection path.\n");
+			rdma_c->send_file = debugfs_create_file("send", 0600, rdma_c->debugfs_dir, rdma_c->send_buf, &send_file_fops);
+			printk(KERN_ERR "create send file.\n");
 			break;
 		case RDMA_CM_EVENT_DISCONNECTED:
 			printk(KERN_ERR "event is DISCONNECTED.\n");

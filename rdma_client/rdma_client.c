@@ -4,10 +4,14 @@
 #include <linux/inet.h>
 #include <linux/slab.h>
 #include <linux/device.h>
+#include <linux/debugfs.h>
 
 #include <rdma/ib_verbs.h>
 #include <rdma/rdma_cm.h>
 #include <rdma/rw.h>
+
+struct dentry *debugfs_root = NULL;
+struct dentry *send_file = NULL;
 
 enum rdma_struct_flags_bit {
 	ADDR_RESOLVED = 0,
@@ -37,20 +41,24 @@ struct rdma_struct {
 #define BUF_SIZE	256		// 256 * 16 = 4096
 	struct ib_sge recv_sgl;
 	struct ib_recv_wr rq_wr;
+	struct ib_cqe rq_cqe;
 	char *recv_buf;
 	dma_addr_t recv_dma_addr;	// dma addr of recv_buf
 
 	struct ib_sge send_sgl;
 	struct ib_send_wr sq_wr;
+	struct ib_cqe sq_cqe;
 	char *send_buf;
 	dma_addr_t send_dma_addr;	// dma addr of send_buf
 
 	struct ib_sge rdma_sgl;
 	struct ib_rdma_wr rdma_sq_wr;
+	struct ib_cqe rdma_sq_cqe;
 	char *rdma_buf;
 	dma_addr_t rdma_dma_addr;	// dma addr of rdma_buf
 
 	struct ib_reg_wr reg_mr_wr;
+	struct ib_cqe reg_mr_cqe;
 
 	u64 remote_key;
 	u64 remote_addr;
@@ -63,6 +71,111 @@ struct rdma_struct rdma_d;
 
 static int do_alloc_qp(struct rdma_cm_id *cm_id, struct ib_pd *pd, struct ib_cq *cq);
 static struct ib_cq *do_alloc_cq(struct rdma_cm_id *cm_id);
+static int send_data(struct rdma_struct *rdma_d);
+static int send_rdma_addr(struct rdma_struct *rdma_d);
+static int send_mr(struct rdma_struct *rdma_d);
+static int recv_rkey(struct rdma_struct *rdma_d);
+
+static int send_file_show(struct seq_file *m, void *ignored)
+{
+	return 0;
+}
+
+static int send_file_open(struct inode *inode, struct file *file) {
+	return single_open(file, send_file_show, inode->i_private);
+}
+
+static ssize_t send_file_write(struct file *file, const char __user *ubuf, size_t cnt, loff_t *ppos)
+{
+	int err;
+
+	if (rdma_d.send_mr_finished == 0) {
+		recv_rkey(&rdma_d);
+		err = send_mr(&rdma_d);
+		if (err) {
+			printk(KERN_ERR "send mr failed.\n");
+			return err;
+		}
+		err = send_rdma_addr(&rdma_d);
+		if (err) {
+			printk(KERN_ERR "send rdma addr failed.\n");
+			return err;
+		}
+	} else {
+		memcpy(rdma_d.send_buf, "liming", 6);
+		send_data(&rdma_d);
+	}
+
+	return cnt;
+}
+
+static int send_file_release(struct inode *inode, struct file *file)
+{
+	return single_release(inode, file);
+}
+
+static const struct file_operations send_file_fops = {
+	.owner = THIS_MODULE,
+	.open = send_file_open,
+	.llseek = seq_lseek,
+	.read = seq_read,
+	.write = send_file_write,
+	.release = send_file_release,
+};
+
+static void rdma_recv_done(struct ib_cq *cq, struct ib_wc *wc)
+{
+	struct rkey_msg *msg;
+	struct rdma_cm_id *cm_id = cq->cq_context;
+	struct rdma_struct *rdma_d = cm_id->context;
+
+	if (likely(wc->status == IB_WC_SUCCESS)) {
+		if (rdma_d->recv_mr_finished == 0) {
+			rdma_d->recv_mr_finished = 1;
+			msg = (struct rkey_msg *)rdma_d->recv_buf;
+			rdma_d->remote_key = cpu_to_be64(msg->remote_key);
+			rdma_d->remote_addr = cpu_to_be64(msg->remote_addr);
+			printk(KERN_ERR "recv mr finished, rkey=%lld, addr=0x%llx.\n", rdma_d->remote_key, rdma_d->remote_addr);
+		} else
+			printk(KERN_ERR "recv data finished.\n");
+
+	}
+	return;
+}
+
+static void rdma_send_done(struct ib_cq *cq, struct ib_wc *wc)
+{
+	struct rdma_cm_id *cm_id = cq->cq_context;
+	struct rdma_struct *rdma_d = cm_id->context;
+
+	if (likely(wc->status == IB_WC_SUCCESS)) {
+		if (rdma_d->send_mr_finished == 0) {
+			rdma_d->send_mr_finished = 1;
+			printk(KERN_ERR "send mr finished.\n");
+		} else {
+			printk(KERN_ERR "send data finished.\n");
+//			recv_rkey(rdma_d);
+		}
+	}
+	return;
+}
+
+static void rdma_rdma_send_done(struct ib_cq *cq, struct ib_wc *wc)
+{
+	if (likely(wc->status == IB_WC_SUCCESS)) {
+		printk(KERN_ERR "send rdma data finished.\n");
+	}
+	return;
+}
+
+static void rdma_reg_mr_done(struct ib_cq *cq, struct ib_wc *wc)
+{
+
+	if (likely(wc->status == IB_WC_SUCCESS)) {
+		printk(KERN_ERR "reg_mr done.\n");
+	}
+	return;
+}
 
 static void init_requests(struct rdma_struct *rdma_d)
 {
@@ -73,6 +186,8 @@ static void init_requests(struct rdma_struct *rdma_d)
 
 	rdma_d->rq_wr.sg_list = &rdma_d->recv_sgl;
 	rdma_d->rq_wr.num_sge = 1;
+	rdma_d->rq_wr.wr_cqe = &rdma_d->rq_cqe;
+	rdma_d->rq_cqe.done = rdma_recv_done;
 
 	// send request
 	rdma_d->send_sgl.addr = rdma_d->send_dma_addr;
@@ -83,16 +198,22 @@ static void init_requests(struct rdma_struct *rdma_d)
 	rdma_d->sq_wr.send_flags = IB_SEND_SIGNALED;
 	rdma_d->sq_wr.sg_list = &rdma_d->send_sgl;
 	rdma_d->sq_wr.num_sge = 1;
+	rdma_d->sq_wr.wr_cqe = &rdma_d->sq_cqe;
+	rdma_d->sq_cqe.done = rdma_send_done;
 
 	// rdma request
 	rdma_d->rdma_sgl.addr = rdma_d->rdma_dma_addr;
 	rdma_d->rdma_sq_wr.wr.send_flags = IB_SEND_SIGNALED;
 	rdma_d->rdma_sq_wr.wr.sg_list = &rdma_d->rdma_sgl;
 	rdma_d->rdma_sq_wr.wr.num_sge = 1;
+	rdma_d->rdma_sq_wr.wr.wr_cqe = &rdma_d->rdma_sq_cqe;
+	rdma_d->rdma_sq_cqe.done = rdma_rdma_send_done;
 
 	// reg mr request
 	rdma_d->reg_mr_wr.wr.opcode = IB_WR_REG_MR;
 	rdma_d->reg_mr_wr.mr = rdma_d->mr;
+	rdma_d->reg_mr_wr.wr.wr_cqe = &rdma_d->reg_mr_cqe;
+	rdma_d->reg_mr_cqe.done = rdma_reg_mr_done;
 }
 
 static int prepare_buffer(struct rdma_struct *rdma_d)
@@ -107,6 +228,7 @@ static int prepare_buffer(struct rdma_struct *rdma_d)
 		printk(KERN_ERR "alloc send_buf failed.\n");
 		goto free_recv_buf;
 	}
+	memcpy(rdma_d->send_buf, "qqqqqqqqqqqqqqqqqq", 18);
 	rdma_d->recv_dma_addr = ib_dma_map_single(rdma_d->pd->device, rdma_d->recv_buf, PAGE_SIZE, DMA_BIDIRECTIONAL);
 	rdma_d->send_dma_addr = ib_dma_map_single(rdma_d->pd->device, rdma_d->send_buf, PAGE_SIZE, DMA_BIDIRECTIONAL);
 	rdma_d->rdma_buf = ib_dma_alloc_coherent(rdma_d->pd->device, PAGE_SIZE, &rdma_d->rdma_dma_addr, GFP_KERNEL);
@@ -155,7 +277,7 @@ static void destroy_buffer(struct rdma_struct *rdma_d)
 
 static int send_mr(struct rdma_struct *rdma_d)
 {
-	const struct ib_send_wr *bad_wr;
+	const struct ib_send_wr *bad_wr = NULL;
 	int ret = 0;
 	u8 key = 0;
 	struct scatterlist sg = {0};
@@ -164,8 +286,8 @@ static int send_mr(struct rdma_struct *rdma_d)
 	ib_update_fast_reg_key(rdma_d->mr, ++key);
 	rdma_d->reg_mr_wr.key = rdma_d->mr->rkey;
 	rdma_d->reg_mr_wr.access = IB_ACCESS_REMOTE_READ | IB_ACCESS_LOCAL_WRITE;
-	sg_dma_address(&sg) = rdma_d->send_buf;
-//	sg_dma_address(&sg) = rdma_d->send_dma_addr;
+//	sg_dma_address(&sg) = rdma_d->send_buf;
+	sg_dma_address(&sg) = rdma_d->send_dma_addr;
 	sg_dma_len(&sg) = PAGE_SIZE;
 
 	ret = ib_map_mr_sg(rdma_d->mr, &sg, 1, NULL, PAGE_SIZE);
@@ -180,38 +302,30 @@ static int send_mr(struct rdma_struct *rdma_d)
 		return -2;
 	}
 
-	ib_req_notify_cq(rdma_d->cq, IB_CQ_NEXT_COMP);
-
 	return 0;
 }
 
 static int send_data(struct rdma_struct *rdma_d)
 {
-	const struct ib_send_wr *bad_wr;
+	const struct ib_send_wr *bad_wr = NULL;
 	int ret;
 
 	printk(KERN_ERR "%s()\n", __func__);
-	memcpy(rdma_d->send_buf, "abccba", 7);
 	ret = ib_post_send(rdma_d->cm_id->qp, &rdma_d->sq_wr, &bad_wr);
 	if (ret) {
 		printk(KERN_ERR "post sq_wr failed\n");
 		return -2;
 	}
+	if (bad_wr != NULL) {
+		printk(KERN_ERR "bad_wr is not NULL.");
+	}
 
-	ib_req_notify_cq(rdma_d->cq, IB_CQ_NEXT_COMP);
 	return 0;
-}
-
-static void send_data_fn(struct work_struct *work)
-{
-	struct rdma_struct *rdma_d = container_of(work, struct rdma_struct, send_data_work);
-
-	send_data(rdma_d);
 }
 
 static int send_rdma_addr(struct rdma_struct *rdma_d)
 {
-	const struct ib_send_wr *bad_wr;
+	const struct ib_send_wr *bad_wr = NULL;
 	int ret;
 	struct rkey_msg *msg;
 
@@ -226,7 +340,6 @@ static int send_rdma_addr(struct rdma_struct *rdma_d)
 	}
 
 	printk(KERN_ERR "%s(): rkey=%d, raddr=0x%lx", __func__, rdma_d->mr->rkey, (unsigned long)rdma_d->recv_buf);
-	ib_req_notify_cq(rdma_d->cq, IB_CQ_NEXT_COMP);
 	return 0;
 }
 
@@ -241,10 +354,10 @@ static int recv_rkey(struct rdma_struct *rdma_d)
 		return -1;
 	}
 
-	ib_req_notify_cq(rdma_d->cq, IB_CQ_NEXT_COMP);
 	return 0;
 }
 
+/*
 static void rdma_cq_event_handler(struct ib_cq *cq, void *ctx)
 {
 	int ret;
@@ -283,8 +396,6 @@ static void rdma_cq_event_handler(struct ib_cq *cq, void *ctx)
 					rdma_d->remote_key = cpu_to_be64(msg->remote_key);
 					rdma_d->remote_addr = cpu_to_be64(msg->remote_addr);
 					printk(KERN_ERR "recv mr finished, rkey=%lld, addr=0x%llx.\n", rdma_d->remote_key, rdma_d->remote_addr);
-					INIT_WORK(&rdma_d->send_data_work, send_data_fn);
-					schedule_work(&rdma_d->send_data_work);
 				} else
 					printk(KERN_ERR "recv data finished.\n");
 				break;
@@ -296,6 +407,7 @@ static void rdma_cq_event_handler(struct ib_cq *cq, void *ctx)
 
 	printk(KERN_ERR "exit %s().\n", __func__);
 }
+*/
 
 static int rdma_cm_handler(struct rdma_cm_id *cm_id, struct rdma_cm_event *event)
 {
@@ -324,11 +436,6 @@ static int rdma_cm_handler(struct rdma_cm_id *cm_id, struct rdma_cm_event *event
 			break;
 		case RDMA_CM_EVENT_ESTABLISHED:
 			printk(KERN_ERR "event is ESTABLISHED.\n");
-			err = send_mr(rdma_d);
-			if (err) {
-				printk(KERN_ERR "send mr failed.\n");
-				break;
-			}
 			break;
 		case RDMA_CM_EVENT_DISCONNECTED:
 			printk(KERN_ERR "event is DISCONNECTED.\n");
@@ -371,12 +478,13 @@ static int rdma_cm_handler(struct rdma_cm_id *cm_id, struct rdma_cm_event *event
 			rdma_d->pd = pd;
 			rdma_d->cq = cq;
 			prepare_buffer(rdma_d);
+
 			conn_param.responder_resources = 1;
 			conn_param.initiator_depth = 1;
 			conn_param.retry_count = 10;
 			printk(KERN_ERR "do connect.\n");
-			err = rdma_connect(rdma_d->cm_id, &conn_param);
-//			err = rdma_connect(cm_id, &conn_param);
+//			err = rdma_connect(rdma_d->cm_id, &conn_param);
+			err = rdma_connect(cm_id, &conn_param);
 			if (err < 0) {
 				printk(KERN_ERR "connect failed.\n");
 			}
@@ -430,16 +538,33 @@ static struct ib_cq *do_alloc_cq(struct rdma_cm_id *cm_id)
 
 	cq_attr.cqe = 128 * 2;
 	cq_attr.comp_vector = 0;
-	return ib_create_cq(cm_id->device, rdma_cq_event_handler, NULL, cm_id, &cq_attr);
-//	return ib_req_notify_cq(rdma_d->cq, IB_CQ_NEXT_COMP);
-//	return ib_alloc_cq(cm_id->device, cm_id, 128 * 2, 0, IB_POLL_WORKQUEUE)
+	return ib_alloc_cq(cm_id->device, cm_id, 128 * 2, 0, IB_POLL_WORKQUEUE);
+//	return ib_create_cq(cm_id->device, rdma_cq_event_handler, NULL, cm_id, &cq_attr);
+}
+
+static void debugfs_cleanup(void)
+{
+	debugfs_remove(send_file);
+	send_file = NULL;
+	debugfs_remove(debugfs_root);
+	debugfs_root = NULL;
+}
+
+static void __init debugfs_init(void)
+{
+	struct dentry *dentry;
+
+	dentry = debugfs_create_dir("rdma_demo", NULL);
+	debugfs_root = dentry;
+
+	send_file = debugfs_create_file("send", 0600, debugfs_root, NULL, &send_file_fops);
 }
 
 static int __init rdma_init(void)
 {
 	int ret = 0;
 	struct sockaddr_in *addr;
-	char *s_ip = "192.168.122.109";
+	char *s_ip = "192.168.122.152";
 	char _addr[16] = {0};
 	int port = 1;
 
@@ -460,6 +585,7 @@ static int __init rdma_init(void)
 	ret = do_rdma_resolve_addr(&rdma_d, addr);
 	if (ret < 0)
 		goto destroy_cm_id;
+	debugfs_init();
 
 	return 0;
 
@@ -484,6 +610,7 @@ destroy_cm_id:
 static void __exit rdma_exit(void)
 {
 	flush_scheduled_work();
+	debugfs_cleanup();
 	if (rdma_d.cm_id) {
 		if (rdma_d.cm_id->qp && !IS_ERR(rdma_d.cm_id->qp))
 			ib_destroy_qp(rdma_d.cm_id->qp);
@@ -498,6 +625,6 @@ static void __exit rdma_exit(void)
 	}
 }
 
-MODULE_LICENSE("GPLv2");
+MODULE_LICENSE("GPL");
 module_init(rdma_init);
 module_exit(rdma_exit);
