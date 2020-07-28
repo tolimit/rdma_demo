@@ -5,14 +5,10 @@
 #include <linux/slab.h>
 #include <linux/mutex.h>
 #include <linux/gfp.h>
-#include <linux/debugfs.h>
 
 #include <rdma/ib_verbs.h>
 #include <rdma/rdma_cm.h>
 #include <rdma/rw.h>
-
-struct dentry *debugfs_root = NULL;
-struct dentry *send_file = NULL;
 
 enum rdma_struct_flags_bit {
 	ADDR_RESOLVED = 0,
@@ -66,8 +62,6 @@ struct rdma_connection {
 	u64 remote_key;
 	u64 remote_addr;
 
-	struct dentry *debugfs_dir;
-	struct dentry *send_file;
 	struct list_head list;
 	struct work_struct disconnect_work;
 };
@@ -232,8 +226,6 @@ static int add_to_connection_list(struct rdma_cm_id *cm_id, struct ib_pd *pd, st
 	_new->pd = pd;
 	_new->cq = cq;
 	cm_id->context = _new;
-	_new->debugfs_dir = NULL;
-	_new->send_file = NULL;
 	INIT_LIST_HEAD(&_new->list);
 	if (prepare_buffer(_new)) {
 		kfree(_new);
@@ -350,10 +342,6 @@ static void do_disconnect(struct work_struct *work)
 	ib_free_cq(rdma_c->cq);
 	ib_dealloc_pd(rdma_c->pd);
 
-	if (rdma_c->debugfs_dir)
-		debugfs_remove(rdma_c->debugfs_dir);
-	if (rdma_c->send_file)
-		debugfs_remove(rdma_c->send_file);
 	kfree(rdma_c);
 	printk(KERN_ERR "do disconnect finished.\n");
 	mutex_unlock(&rdma_d.connection_lock);
@@ -446,8 +434,8 @@ static void rdma_recv_done(struct ib_cq *cq, struct ib_wc *wc)
 	if (likely(wc->status == IB_WC_SUCCESS)) {
 		if (rdma_cc)
 			recv_data(rdma_cc);
-		printk(KERN_ERR "recv data buf[0]=%c, buf[1]=%c, buf[2]=%c, buf[3]=%c.\n",
-				rdma_cc->recv_buf[0], rdma_cc->recv_buf[1], rdma_cc->recv_buf[2], rdma_cc->recv_buf[3]);
+		printk(KERN_ERR "recv data \"%s\".\n",
+				rdma_cc->recv_buf);
 	}
 //	printk(KERN_ERR "exit %s().\n", __func__);
 }
@@ -565,10 +553,6 @@ static int rdma_cm_handler(struct rdma_cm_id *cm_id, struct rdma_cm_event *event
 			printk(KERN_ERR "event is ESTABLISHED.\n");
 			rdma_c = cm_id->context;
 			rdma_cc = rdma_c;
-			rdma_c->debugfs_dir = debugfs_create_dir("connection", debugfs_root);
-			printk(KERN_ERR "create connection path.\n");
-			rdma_c->send_file = debugfs_create_file("send", 0600, rdma_c->debugfs_dir, rdma_c->send_buf, &send_file_fops);
-			printk(KERN_ERR "create send file.\n");
 			break;
 		case RDMA_CM_EVENT_DISCONNECTED:
 			printk(KERN_ERR "event is DISCONNECTED.\n");
@@ -627,24 +611,6 @@ static struct ib_cq *do_alloc_cq(struct rdma_cm_id *cm_id)
 	return ib_alloc_cq(cm_id->device, cm_id, 128 * 2, 0, IB_POLL_WORKQUEUE);
 }
 
-static void debugfs_cleanup(void)
-{
-//	debugfs_remove(send_file);
-	send_file = NULL;
-	debugfs_remove(debugfs_root);
-	debugfs_root = NULL;
-}
-
-static void __init debugfs_init(void)
-{
-	struct dentry *dentry;
-
-	dentry = debugfs_create_dir("rdma_demo", NULL);
-	debugfs_root = dentry;
-
-//	send_file = debugfs_create_file("send", 0600, debugfs_root, rdma_d.send_buf, &send_file_fops);
-}
-
 static int __init rdma_init(void) {
 	int ret;
 	struct sockaddr_in *addr;
@@ -678,7 +644,6 @@ static int __init rdma_init(void) {
 		printk(KERN_ERR "listen failed.\n");
 		goto destroy_cm_id;
 	}
-	debugfs_init();
 
 	return 0;
 
@@ -717,7 +682,6 @@ static void __exit rdma_exit(void)
 	flush_scheduled_work();
 
 	printk(KERN_ERR "destroy rdma_d.cm_id\n");
-	debugfs_cleanup();
 	if (rdma_d.cm_id)
 		rdma_destroy_id(rdma_d.cm_id);
 }
