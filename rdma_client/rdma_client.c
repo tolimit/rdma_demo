@@ -87,24 +87,14 @@ static int send_file_open(struct inode *inode, struct file *file) {
 
 static ssize_t send_file_write(struct file *file, const char __user *ubuf, size_t cnt, loff_t *ppos)
 {
-	int err;
-
-	if (rdma_d.send_mr_finished == 0) {
-		recv_rkey(&rdma_d);
-		err = send_mr(&rdma_d);
-		if (err) {
-			printk(KERN_ERR "send mr failed.\n");
-			return err;
-		}
-		err = send_rdma_addr(&rdma_d);
-		if (err) {
-			printk(KERN_ERR "send rdma addr failed.\n");
-			return err;
-		}
-	} else {
-		memcpy(rdma_d.send_buf, "liming", 6);
-		send_data(&rdma_d);
+	if (cnt <= 0 || cnt >= 4095) {
+		printk(KERN_ERR "data error.\n");
+		return -ENOSPC;
 	}
+	if (copy_from_user(rdma_d.send_buf, ubuf, cnt))
+		return -EFAULT;
+	rdma_d.send_buf[cnt] = '\0';
+	send_data(&rdma_d);
 
 	return cnt;
 }
@@ -154,7 +144,6 @@ static void rdma_send_done(struct ib_cq *cq, struct ib_wc *wc)
 			printk(KERN_ERR "send mr finished.\n");
 		} else {
 			printk(KERN_ERR "send data finished.\n");
-//			recv_rkey(rdma_d);
 		}
 	}
 	return;
@@ -228,7 +217,6 @@ static int prepare_buffer(struct rdma_struct *rdma_d)
 		printk(KERN_ERR "alloc send_buf failed.\n");
 		goto free_recv_buf;
 	}
-	memcpy(rdma_d->send_buf, "qqqqqqqqqqqqqqqqqq", 18);
 	rdma_d->recv_dma_addr = ib_dma_map_single(rdma_d->pd->device, rdma_d->recv_buf, PAGE_SIZE, DMA_BIDIRECTIONAL);
 	rdma_d->send_dma_addr = ib_dma_map_single(rdma_d->pd->device, rdma_d->send_buf, PAGE_SIZE, DMA_BIDIRECTIONAL);
 	rdma_d->rdma_buf = ib_dma_alloc_coherent(rdma_d->pd->device, PAGE_SIZE, &rdma_d->rdma_dma_addr, GFP_KERNEL);
@@ -436,6 +424,17 @@ static int rdma_cm_handler(struct rdma_cm_id *cm_id, struct rdma_cm_event *event
 			break;
 		case RDMA_CM_EVENT_ESTABLISHED:
 			printk(KERN_ERR "event is ESTABLISHED.\n");
+			recv_rkey(rdma_d);
+			err = send_mr(rdma_d);
+			if (err) {
+				printk(KERN_ERR "send mr failed.\n");
+				return err;
+			}
+			err = send_rdma_addr(rdma_d);
+			if (err) {
+				printk(KERN_ERR "send rdma addr failed.\n");
+				return err;
+			}
 			break;
 		case RDMA_CM_EVENT_DISCONNECTED:
 			printk(KERN_ERR "event is DISCONNECTED.\n");
@@ -483,7 +482,6 @@ static int rdma_cm_handler(struct rdma_cm_id *cm_id, struct rdma_cm_event *event
 			conn_param.initiator_depth = 1;
 			conn_param.retry_count = 10;
 			printk(KERN_ERR "do connect.\n");
-//			err = rdma_connect(rdma_d->cm_id, &conn_param);
 			err = rdma_connect(cm_id, &conn_param);
 			if (err < 0) {
 				printk(KERN_ERR "connect failed.\n");
