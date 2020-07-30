@@ -356,10 +356,10 @@ static int send_mr(struct rdma_connection *rdma_c)
 
 	ib_update_fast_reg_key(rdma_c->mr, ++key);
 	rdma_c->reg_mr_wr.key = rdma_c->mr->rkey;
-	rdma_c->reg_mr_wr.access = IB_ACCESS_REMOTE_WRITE | IB_ACCESS_LOCAL_WRITE;
-//	sg_dma_address(&sg) = rdma_c->send_buf;
+	rdma_c->reg_mr_wr.access = IB_ACCESS_REMOTE_WRITE | IB_ACCESS_REMOTE_READ | IB_ACCESS_LOCAL_WRITE;
 	sg_dma_address(&sg) = rdma_c->recv_dma_addr;
 	sg_dma_len(&sg) = PAGE_SIZE;
+	printk(KERN_ERR "reg_mr key=%d, dma_addr=0x%llx.\n", rdma_c->reg_mr_wr.key, rdma_c->recv_dma_addr);
 
 	ret = ib_map_mr_sg(rdma_c->mr, &sg, 1, NULL, PAGE_SIZE);
 	if (ret < 0 || ret > PAGE_SIZE) {
@@ -452,10 +452,13 @@ static void rdma_recv_mr_done(struct ib_cq *cq, struct ib_wc *wc)
 			msg = (struct rkey_msg *)rdma_c->recv_buf;
 			rdma_c->remote_key = cpu_to_be64(msg->remote_key);
 			rdma_c->remote_addr = cpu_to_be64(msg->remote_addr);
+			printk(KERN_ERR "recv mr finished, rkey=%lld, raddr=0x%llx.\n", rdma_c->remote_key, rdma_c->remote_addr);
 
 			send_mr(rdma_c);
 			send_rdma_addr(rdma_c);
-			printk(KERN_ERR "recv mr finished, rkey=%lld, raddr=0x%llx.\n", rdma_c->remote_key, rdma_c->remote_addr);
+			// only for client uses IB_WR_RDMA_READ to read data from server
+			memcpy(rdma_c->recv_buf, "abcdefedcba test", 17);
+			printk("recv_buf data=\"%s\"\n", rdma_c->recv_buf);
 		} else {
 			printk(KERN_ERR "recv_mr() recv data finished.\n");
 		}
